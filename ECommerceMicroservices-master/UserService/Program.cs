@@ -1,0 +1,643 @@
+﻿using System.ComponentModel.DataAnnotations;
+using System.IdentityModel.Tokens.Jwt;
+using System.Security.Claims;
+using System.Text;
+using ECommerce.Common.DTOs;
+using ECommerce.Common.Extensions;
+using FluentValidation;
+using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.IdentityModel.Tokens;
+using Serilog;
+using UserService.Data;
+using UserService.DTOs;
+using UserService.Models;
+using UserService.Services;
+using UserService.Services.Data;
+using BC = BCrypt.Net.BCrypt;
+using MassTransit;
+using ECommerce.Common.Events;
+
+var builder = WebApplication.CreateBuilder(args);
+
+Log.Logger = new LoggerConfiguration()
+    .MinimumLevel.Information()
+    .WriteTo.Console(outputTemplate:
+        "[{Timestamp:HH:mm:ss} {Level:u3}] {Message:lj}{NewLine}{Exception}")
+    .Enrich.FromLogContext()
+    .CreateLogger();
+
+//var builder = WebApplication.CreateBuilder(args);
+
+// Usar Serilog
+builder.Host.UseSerilog();
+
+
+// Configurar Serilog
+builder.ConfigureSerilog("UserService");
+
+//Configurar JWT
+var jwtSettings = builder.Configuration.GetSection("JwtSettings");
+var secretKey = Encoding.UTF8.GetBytes(jwtSettings["SecretKey"] ?? "SuperSecretKey123!@#ForDevelopmentOnly");
+
+builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
+    .AddJwtBearer(options =>
+    {
+        options.TokenValidationParameters = new TokenValidationParameters
+        {
+            ValidateIssuer = true,
+            ValidateAudience = true,
+            ValidateLifetime = true,
+            ValidateIssuerSigningKey = true,
+            ValidIssuer = jwtSettings["Issuer"],
+            ValidAudience = jwtSettings["Audience"],
+            IssuerSigningKey = new SymmetricSecurityKey(secretKey)
+        };
+    });
+
+builder.Services.AddAuthorization();
+
+// Agregar servicios
+builder.Services.AddEndpointsApiExplorer();
+builder.Services.AddSwaggerGen(c =>
+{
+    c.SwaggerDoc("v1", new() { Title = "User Service API", Version = "v1" });
+    c.AddSecurityDefinition("Bearer", new()
+    {
+        Description = "JWT Authorization header using the Bearer scheme",
+        Name = "Authorization",
+        In = Microsoft.OpenApi.Models.ParameterLocation.Header,
+        Type = Microsoft.OpenApi.Models.SecuritySchemeType.ApiKey,
+        Scheme = "Bearer"
+    });
+});
+
+// Configurar Entity Framework sin dccker
+//builder.Services.AddDbContext<UserDbContext>(options =>
+//    options.UseSqlServer(builder.Configuration.GetConnectionString("DefaultConnection")));
+builder.Services.AddDbContext<UserDbContext>(options =>
+{
+    var connectionString = builder.Configuration.GetConnectionString("DefaultConnection");
+    options.UseSqlServer(connectionString);
+});
+
+// Registrar servicios
+builder.Services.AddScoped<IUserService, UserECService>();
+builder.Services.AddScoped<ITokenService, TokenService>();
+builder.Services.AddValidatorsFromAssemblyContaining<Program>();
+
+// Health checks
+builder.Services.AddStandardHealthChecks(builder.Configuration.GetConnectionString("DefaultConnection"));
+
+// CORS
+builder.Services.AddCors(options =>
+{
+    options.AddPolicy("AllowAll", policy =>
+    {
+        policy.AllowAnyOrigin()
+              .AllowAnyMethod()
+              .AllowAnyHeader();
+    });
+});
+
+
+builder.Services.AddMassTransit(x =>
+{
+    // Configurar consumidores aquí
+    x.AddConsumer<ProductCreatedConsumer>();
+    x.AddConsumer<TestMessageConsumer>();
+
+    x.UsingRabbitMq((context, cfg) =>
+    {
+        // Leer configuración de RabbitMQ
+        var rabbitHost = builder.Configuration["RabbitMQ:Host"] ?? "localhost";
+        var rabbitUser = builder.Configuration["RabbitMQ:Username"] ?? "admin";
+        var rabbitPass = builder.Configuration["RabbitMQ:Password"] ?? "admin123";
+
+        cfg.Host(rabbitHost, "/", h =>
+        {
+            h.Username(rabbitUser);
+            h.Password(rabbitPass);
+        });
+
+        // Configurar el consumer
+        cfg.ReceiveEndpoint("user-service-queue", e =>
+        {
+            e.ConfigureConsumer<ProductCreatedConsumer>(context);
+        });
+
+        cfg.ReceiveEndpoint("test-queue", e =>
+        {
+            e.ConfigureConsumer<TestMessageConsumer>(context);
+        });
+        //cfg.ConfigureEndpoints(context);
+    });
+});
+
+
+//sin docker
+//builder.Services.AddMassTransit(x =>
+//{
+//    // Registrar el consumer
+//    x.AddConsumer<ProductCreatedConsumer>();
+//    x.AddConsumer<TestMessageConsumer>();
+
+//    x.UsingRabbitMq((context, cfg) =>
+//    {
+//        cfg.Host("localhost", "/", h =>
+//        {
+//            h.Username("admin");
+//            h.Password("admin123");
+//        });
+
+//        // Configurar el consumer
+//        cfg.ReceiveEndpoint("user-service-queue", e =>
+//        {
+//            e.ConfigureConsumer<ProductCreatedConsumer>(context);
+//        });
+
+//        cfg.ReceiveEndpoint("test-queue", e =>
+//        {
+//            e.ConfigureConsumer<TestMessageConsumer>(context);
+//        });
+//    });
+//});
+
+var app = builder.Build();
+
+// Middleware pipeline
+app.UseCorrelationId();
+app.UseCors("AllowAll");
+app.UseAuthentication();
+app.UseAuthorization();
+
+if (app.Environment.IsDevelopment())
+{
+    app.UseSwagger();
+    app.UseSwaggerUI();
+}
+
+// Aplicar migraciones automáticamente
+using (var scope = app.Services.CreateScope())
+{
+    var dbContext = scope.ServiceProvider.GetRequiredService<UserDbContext>();
+    dbContext.Database.Migrate();
+
+    // Seed data si está vacío
+    if (!dbContext.Users.Any())
+    {
+        DataSeeder.SeedUsers(dbContext);
+    }
+}
+///////////////////////////////con JWT/////////////////////////////////////
+#region SIN JWT
+///////////////////////////////SIN JWT/////////////////////////////////////
+//// Configurar Serilog
+//Log.Logger = new LoggerConfiguration()
+//    .MinimumLevel.Information()
+//    .WriteTo.Console(outputTemplate:
+//        "[{Timestamp:HH:mm:ss} {Level:u3}] {Message:lj}{NewLine}{Exception}")
+//    .Enrich.FromLogContext()
+//    .CreateLogger();
+
+//var builder = WebApplication.CreateBuilder(args);
+
+// Usar Serilog
+//builder.Host.UseSerilog();
+
+//// Agregar servicios
+//builder.Services.AddEndpointsApiExplorer();
+//builder.Services.AddSwaggerGen(c =>
+//{
+//    c.SwaggerDoc("v1", new()
+//    {
+//        Title = "User Service API",
+//        Version = "v1",
+//        Description = "Microservicio de Gestión de Usuarios - TAREA 1"
+//    });
+//});
+
+//// Configurar Entity Framework
+//builder.Services.AddDbContext<UserDbContext>(options =>
+//    options.UseSqlServer(builder.Configuration.GetConnectionString("DefaultConnection")));
+
+//// Registrar servicios
+//builder.Services.AddScoped<IUserService, UserService.Services.UserECService>();
+
+//// Registrar validadores cuando los implementen
+//builder.Services.AddValidatorsFromAssemblyContaining<Program>();
+
+//// Health checks
+//builder.Services.AddHealthChecks()
+//    .AddSqlServer(
+//        builder.Configuration.GetConnectionString("DefaultConnection") ?? "",
+//        name: "database");
+
+//// CORS
+//builder.Services.AddCors(options =>
+//{
+//    options.AddPolicy("AllowAll", policy =>
+//    {
+//        policy.AllowAnyOrigin()
+//              .AllowAnyMethod()
+//              .AllowAnyHeader();
+//    });
+//});
+
+//var app = builder.Build();
+
+//// Configurar el pipeline
+//app.UseSerilogRequestLogging();
+//app.UseCors("AllowAll");
+
+//if (app.Environment.IsDevelopment())
+//{
+//    app.UseSwagger();
+//    app.UseSwaggerUI(c =>
+//    {
+//        c.SwaggerEndpoint("/swagger/v1/swagger.json", "User Service API v1");
+//        c.RoutePrefix = string.Empty;
+//    });
+//}
+
+//// Aplicar migraciones automáticamente
+//using (var scope = app.Services.CreateScope())
+//{
+//    var dbContext = scope.ServiceProvider.GetRequiredService<UserDbContext>();
+//    dbContext.Database.Migrate();
+
+//    // Seed data si está vacío
+//    if (!dbContext.Users.Any())
+//    {
+//        DataSeeder.SeedUsers(dbContext);
+//    }
+//}
+#endregion SIN JWT
+///////////////////////////////SIN JWT/////////////////////////////////////
+
+// ============================================
+// ENDPOINTS
+// ============================================
+
+// POST /api/auth/register - Registro de usuario
+app.MapPost("/api/auth/register", async (
+    RegisterDto dto,
+    IUserService userService,
+    IValidator<RegisterDto> validator) =>
+{
+    var validationResult = await validator.ValidateAsync(dto);
+    if (!validationResult.IsValid)
+    {
+        return Results.BadRequest(ApiResponse<UserDto>.Fail(
+            "Validation fallida",
+            validationResult.Errors.Select(e => e.ErrorMessage).ToList()));
+    }
+
+    try
+    {
+        var user = await userService.RegisterAsync(dto);
+        return Results.Created($"/api/users/{user.Id}",
+            ApiResponse<UserDto>.Ok(user, "User registrado ok"));
+    }
+    catch (Exception ex)
+    {
+        Log.Error(ex, "Error al registrar el usuario");
+        return Results.Problem("Un error occurrio durante el registro");
+    }
+})
+.WithName("Register")
+.Produces<ApiResponse<UserDto>>(201)
+.Produces(400)
+.AllowAnonymous()
+.WithOpenApi();
+
+// POST /api/auth/login - Login de usuario
+app.MapPost("/api/auth/login", async (
+    LoginDto dto,
+    IUserService userService,
+    ITokenService tokenService,
+    IValidator<LoginDto> validator) =>
+{
+    var validationResult = await validator.ValidateAsync(dto);
+    if (!validationResult.IsValid)
+    {
+        return Results.BadRequest(ApiResponse<LoginResponseDto>.Fail(
+            "Validation fallida",
+            validationResult.Errors.Select(e => e.ErrorMessage).ToList()));
+    }
+
+    try
+    {
+        var user = await userService.ValidateCredentialsAsync(dto.Email, dto.Password);
+        if (user == null)
+        {
+            return Results.Unauthorized();// (ApiResponse<LoginResponseDto>.Fail("Credenciales invalidas"));
+        }
+
+        var token = tokenService.GenerateToken(user);
+        var response = new LoginResponseDto
+        {
+            User = user,
+            Token = token,
+            ExpiresIn = 3600 // 1 hora
+        };
+
+        return Results.Ok(ApiResponse<LoginResponseDto>.Ok(response, "Login ok"));
+    }
+    catch (Exception ex)
+    {
+        Log.Error(ex, "Error en el login");
+        return Results.Problem("Un error occurrio mientras se hacia login");
+    }
+})
+.WithName("Login")
+.Produces<ApiResponse<LoginResponseDto>>(200)
+.Produces(401)
+.AllowAnonymous()
+.WithOpenApi();
+
+// GET /api/users - Obtener todos los usuarios (Admin only)
+app.MapGet("/api/users", async (IUserService userService, ClaimsPrincipal user) =>
+{
+    try
+    {
+        // Verificar si es admin
+        if (!user.IsInRole("Admin"))
+        {
+            return Results.Forbid();
+        }
+
+        var users = await userService.GetAllUsersAsync();
+        return Results.Ok(ApiResponse<List<UserDto>>.Ok(users));
+    }
+    catch (Exception ex)
+    {
+        Log.Error(ex, "Error obteniendo usuarios");
+        return Results.Problem("Un error occurrio mientras se obtenia los usuarios");
+    }
+})
+.RequireAuthorization()
+.WithName("GetUsers")
+.Produces<ApiResponse<List<UserDto>>>(200)
+.Produces(403)
+.WithOpenApi();
+
+// GET /api/users/{id} - Obtener usuario por ID
+app.MapGet("/api/users/{id:int}", async (int id, IUserService userService) =>
+{
+    try
+    {
+        var user = await userService.GetUserByIdAsync(id);
+        if (user == null)
+            return Results.NotFound(ApiResponse<UserDto>.Fail($"Usuario con ID {id} no se encontro"));
+
+        return Results.Ok(ApiResponse<UserDto>.Ok(user));
+    }
+    catch (Exception ex)
+    {
+        Log.Error(ex, "Error obteniendo usuario {UserId}", id);
+        return Results.Problem($"Un error occurrio mientras se consultaba al usuario {id}");
+    }
+})
+.WithName("GetUserById")
+.Produces<ApiResponse<UserDto>>(200)
+.Produces(404)
+.WithOpenApi();
+
+// PUT /api/users/{id}/validate-email - Validar email GDPR
+app.MapPut("/api/users/{id:int}/validate-email", async (
+    int id,
+    IUserService userService) =>
+{
+    try
+    {
+        var isValid = await userService.ValidateEmailGDPRAsync(id);
+        var message = isValid
+            ? "Email cumple con GDPR (EU domain)"
+            : "Email no cumple con GDPR (non-EU domain)";
+
+        return Results.Ok(ApiResponse<bool>.Ok(isValid, message));
+    }
+    catch (Exception ex)
+    {
+        Log.Error(ex, "Error validadando el correo del usuario {UserId}", id);
+        return Results.Problem($"Un error occurrio mientras se validaba el correo del usuario {id}");
+    }
+})
+.WithName("ValidateEmailGDPR")
+.Produces<ApiResponse<bool>>(200)
+.WithOpenApi();
+
+// GET /api/users/{id}/discount - Obtener descuento premium
+app.MapGet("/api/users/{id:int}/discount", async (
+    int id,
+    IUserService userService) =>
+{
+    try
+    {
+        var discount = await userService.GetUserDiscountAsync(id);
+        if (discount == null)
+            return Results.NotFound(ApiResponse<decimal>.Fail($"Usuario con ID {id} no se encontro"));
+
+        return Results.Ok(ApiResponse<decimal>.Ok(discount.Value,
+            $"Descuento para el usuario: {discount.Value:P}"));
+    }
+    catch (Exception ex)
+    {
+        Log.Error(ex, "Error al obtener el descuento del usuario {UserId}", id);
+        return Results.Problem($"Un error occurrio mientras se obtenia el descuento para el usuario {id}");
+    }
+})
+.WithName("GetUserDiscount")
+.Produces<ApiResponse<decimal>>(200)
+.Produces(404)
+.WithOpenApi();
+
+app.MapPost("/api/users", async (
+    CreateUserDto dto,
+    IUserService userService,
+    IValidator<CreateUserDto> validator,
+    IPublishEndpoint publishEndpoint) =>
+{
+    try
+    {
+        var validationResult = await validator.ValidateAsync(dto);
+        if (!validationResult.IsValid)
+        {
+            return Results.BadRequest(ApiResponse<UserDto>.Fail("Invalid user data"));
+        }
+
+        var user = await userService.CreateUserAsync(dto);
+
+        // Publicar evento
+        var userEvent = new UserCreatedEvent
+        {
+            UserId = user.Id,
+            Email = user.Email,
+            RandomNumber = Random.Shared.Next(1, 100)
+        };
+
+        await publishEndpoint.Publish(userEvent);
+        Log.Information("📤 Evento UserCreated publicado con número: {Number}",
+            userEvent.RandomNumber);
+
+        return Results.Created($"/api/users/{user.Id}",
+            ApiResponse<UserDto>.Ok(user, "Usuario creado y evento publicado"));
+    }
+    catch (Exception ex)
+    {
+        Log.Error(ex, "Error creando usuario");
+        return Results.Problem("Error al crear el usuario");
+    }
+})
+.WithName("CreateUser")
+.WithOpenApi()
+.Produces<ApiResponse<UserDto>>(StatusCodes.Status201Created)
+.Produces(400);
+
+
+// PUT /api/users/{id} - Actualizar usuario
+app.MapPut("/api/users/{id:int}", async (int id, UpdateUserDto dto, IUserService userService,
+    IValidator<UpdateUserDto> validator) =>
+{
+    try
+    {
+        // TODO (B.3): validar el dto con IValidator<UpdateUserDto> antes de actualizar
+        var validationResult = await validator.ValidateAsync(dto);
+        if (!validationResult.IsValid)
+        {
+            Log.Warning("Validation failed for updating user {UserId}: {Errors}", id,
+                validationResult.Errors.Select(e => e.ErrorMessage).ToList());
+            return Results.BadRequest(ApiResponse<UserDto>.Fail(
+                "Validation failed",
+                validationResult.Errors.Select(e => e.ErrorMessage).ToList()));
+        }
+
+        Log.Information("Updating user {UserId}", id);
+        var user = await userService.UpdateUserAsync(id, dto);
+        if (user == null)
+        {
+            Log.Warning("User {UserId} not found for update", id);
+            return Results.NotFound(ApiResponse<UserDto>.Fail($"User with ID {id} not found"));
+        }
+        Log.Information("User {UserId} updated successfully", id);
+        return Results.Ok(ApiResponse<UserDto>.Ok(user, "User updated successfully"));
+    }
+    catch (InvalidOperationException ex)
+    {
+        Log.Warning(ex, "Validation error updating user {UserId}", id);
+        return Results.BadRequest(ApiResponse<UserDto>.Fail(ex.Message));
+    }
+    catch (Exception ex)
+    {
+        Log.Error(ex, "Error updating user {UserId}", id);
+        return Results.Problem($"An error occurred while updating user {id}");
+    }
+})
+.WithName("UpdateUser")
+.WithOpenApi()
+.Produces<ApiResponse<UserDto>>(StatusCodes.Status200OK)
+.Produces(StatusCodes.Status404NotFound)
+.Produces(StatusCodes.Status400BadRequest)
+.WithSummary("Actualizar usuario")
+.WithDescription("Actualiza los datos de un usuario existente.");
+
+// DELETE /api/users/{id} - Eliminar usuario
+app.MapDelete("/api/users/{id:int}", async (int id, IUserService catalogService) =>
+{
+    try
+    {
+        var result = await catalogService.DeleteUserAsync(id);
+        if (!result)
+            return Results.NotFound(ApiResponse<bool>.Fail($"Usuario con ID {id} no se encontro"));
+
+        return Results.Ok(ApiResponse<bool>.Ok(true, "Usuario borrado ok"));
+    }
+    catch (Exception ex)
+    {
+        Log.Error(ex, "Error borrando el usuario {UserId}", id);
+        return Results.Problem($"Un error occurrio mientras se borraba el usuario {id}");
+    }
+})
+.WithName("DeleteUser")
+.Produces<ApiResponse<bool>>(200)
+.Produces(404)
+.WithOpenApi()
+.WithSummary("Eliminar usuario")
+.WithDescription("Elimina logicamente el registro de un usuario existente.");
+
+///Endpoints definition end
+// Health check endpoint
+app.MapHealthChecks("/health");
+
+// Endpoint de información
+app.MapGet("/", () => new
+{
+    Service = "Servicio de usuarios",
+    Version = "1.0.0",
+    Status = "Running",
+    Endpoints = new[]
+    {
+        "POST /api/auth/register",
+        "POST /api/auth/login",
+        "GET /api/users",
+        "PUT /api/users/{id}/validate-email",
+        "PUT /api/users/{id}",
+        "GET /api/users/{id}",
+        "GET /api/users/{id}/discount",
+        "PUT /api/users/{id}",
+        "DELETE /api/users/{id}",
+        "GET /health"
+    },
+    Documentation = "/swagger"
+});
+
+Console.WriteLine("🚀 Sistema E-Commerce Microservicio de Usuario iniciado");
+Console.WriteLine("📍 Swagger disponible en: https://localhost:7002/swagger");
+app.Run();
+
+// Hacer la clase Program testeable
+public partial class Program { }
+
+public class ProductCreatedConsumer : IConsumer<ProductCreatedEvent>
+{
+    private readonly ILogger<ProductCreatedConsumer> _logger;
+
+    public ProductCreatedConsumer(ILogger<ProductCreatedConsumer> logger)
+    {
+        _logger = logger;
+    }
+
+    public async Task Consume(ConsumeContext<ProductCreatedEvent> context)
+    {
+        var message = context.Message;
+
+        _logger.LogInformation("📨 EVENTO RECIBIDO EN USER SERVICE:");
+        _logger.LogInformation("   ProductId: {ProductId}", message.ProductId);
+        _logger.LogInformation("   ProductName: {ProductName}", message.ProductName);
+        _logger.LogInformation("   Price: ${Price}", message.Price);
+        _logger.LogInformation("   Message: {Message}", message.Message);
+        _logger.LogInformation("   CreatedAt: {CreatedAt}", message.CreatedAt);
+
+        // Simular procesamiento
+        await Task.Delay(1000);
+
+        // Aquí podrías:
+        // - Enviar email a usuarios premium sobre nuevo producto
+        // - Actualizar estadísticas
+        // - Guardar en cache
+        // - etc.
+
+        _logger.LogInformation("✅ Evento ProductCreated procesado exitosamente");
+    }
+}
+
+public class TestMessageConsumer : IConsumer<TestMessageEvent>
+{
+    public async Task Consume(ConsumeContext<TestMessageEvent> context)
+    {
+        Console.WriteLine($"📨 Mensaje recibido: {context.Message.Message}");
+        Console.WriteLine($"   Número: {context.Message.RandomNumber}");
+        await Task.CompletedTask;
+    }
+}
