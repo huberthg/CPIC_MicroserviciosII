@@ -1,30 +1,37 @@
-**/.classpath
-**/.dockerignore
-**/.env
-**/.git
-**/.gitignore
-**/.project
-**/.settings
-**/.toolstarget
+# =====================================================================
+# .dockerignore · Semana 4 (S4-10)
+#
+# Lo que Docker NO copia al contexto de build. Va en la RAÍZ de la solución,
+# porque ese es el contexto (context: .. en docker-compose.yml).
+#
+# Sin este archivo, «COPY . /src/» se lleva también las carpetas bin/ y obj/
+# que Visual Studio generó en Windows: el contexto pesa decenas de MB más,
+# el build tarda más y, a veces, esos obj/ confunden al compilador de Linux.
+# =====================================================================
+
+# Resultados de compilación de Visual Studio / dotnet
+**/bin
+**/obj
+**/out
+
+# Configuración local del IDE y del control de versiones
 **/.vs
 **/.vscode
-**/*.*proj.user
-**/*.dbmdl
-**/*.jfm
-**/azds.yaml
-**/bin
-**/charts
-**/docker-compose*
+**/.idea
+**/*.user
+**/*.suo
+**/.git
+**/.gitignore
+
+# Lo que no forma parte de ninguna imagen
 **/Dockerfile*
+**/docker-compose*
+**/.dockerignore
+**/.env
 **/node_modules
-**/npm-debug.log
-**/obj
-**/secrets.dev.yaml
-**/values.dev.yaml
-LICENSE
-README.md
-!**/.gitignore
-!.git/HEAD
-!.git/config
-!.git/packed-refs
-!.git/refs/heads/**
+**/Postman
+**/Screenshots
+**/*.md
+**/*.zip
+LICENSE.txt
+Verificar-Entorno.ps1

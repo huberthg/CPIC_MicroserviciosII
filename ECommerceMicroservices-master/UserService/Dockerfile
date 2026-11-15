@@ -1,43 +1,47 @@
-# =============================================
-# ETAPA 1: Base - Imagen de runtime
-# =============================================
+# =====================================================================
+# UserService/Dockerfile 路 CONTEXTO USUARIOS 路 Semana 4 (S4-03)
+#
+# Copia del Dockerfile de Cat谩logo. Cambian TRES l铆neas, marcadas 芦CAMBIA禄.
+# Usuarios no usa ECommerce.Contracts; la l铆nea que copia su .csproj
+# no estorba y deja el archivo id茅ntico al de Cat谩logo salvo tres l铆neas.
+# Se construye desde la RA脥Z de la soluci贸n:
+#
+#     docker build -t user-service:s4 -f UserService/Dockerfile .
+# =====================================================================
+
+# ---- Etapa 1 路 base: el runtime de ASP.NET Core 8 (sin compilador) -------
 FROM mcr.microsoft.com/dotnet/aspnet:8.0 AS base
 WORKDIR /app
-EXPOSE 80
-EXPOSE 443
+# Adentro del contenedor, .NET 8 escucha en el puerto 8080.
+# Afuera, docker-compose.yml lo publica como 5002 ("5002:8080").
+EXPOSE 8080
+# curl: lo usan el healthcheck (S4-13) y la prueba de red por nombre (S4-08)
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl \
+    && rm -rf /var/lib/apt/lists/*
 
-# =============================================
-# ETAPA 2: Build - Compilaci髇
-# =============================================
+# ---- Etapa 2 路 build: el SDK completo, solo para compilar ----------------
 FROM mcr.microsoft.com/dotnet/sdk:8.0 AS build
-ARG BUILD_CONFIGURATION=Release
 WORKDIR /src
-
-# Copiar archivos de proyecto para restore
+# Primero SOLO los .csproj y el restore. Mientras las dependencias no
+# cambien, Docker reutiliza esta capa (cach茅) y el build tarda segundos.
+COPY ["ECommerce.Contracts/ECommerce.Contracts.csproj", "ECommerce.Contracts/"]
+# CAMBIA (1 de 3): la carpeta y el .csproj del servicio
 COPY ["UserService/UserService.csproj", "UserService/"]
-COPY ["ECommerce.Common/ECommerce.Common.csproj", "ECommerce.Common/"]
+# CAMBIA (2 de 3): la carpeta de trabajo del servicio
+WORKDIR /src/UserService
+RUN dotnet restore
+# Ahora s铆, todo el c贸digo (lo que .dockerignore deja pasar)
+COPY . /src/
+RUN dotnet build -c Release -o /app/build
 
-# Restaurar dependencias
-RUN dotnet restore "UserService/UserService.csproj"
-
-# Copiar todo el c骴igo fuente
-COPY . .
-
-# Compilar
-WORKDIR "/src/UserService"
-RUN dotnet build "UserService.csproj" -c $BUILD_CONFIGURATION -o /app/build
-
-# =============================================
-# ETAPA 3: Publish - Publicaci髇
-# =============================================
+# ---- Etapa 3 路 publish: deja solo lo necesario para correr --------------
 FROM build AS publish
-ARG BUILD_CONFIGURATION=Release
-RUN dotnet publish "UserService.csproj" -c $BUILD_CONFIGURATION -o /app/publish /p:UseAppHost=false
+RUN dotnet publish -c Release -o /app/publish /p:UseAppHost=false
 
-# =============================================
-# ETAPA 4: Final - Imagen final
-# =============================================
+# ---- Etapa 4 路 final: runtime + lo publicado. ESTA es la imagen ----------
 FROM base AS final
 WORKDIR /app
 COPY --from=publish /app/publish .
+# CAMBIA (3 de 3): el .dll que se ejecuta
 ENTRYPOINT ["dotnet", "UserService.dll"]

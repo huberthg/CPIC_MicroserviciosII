@@ -1,4 +1,4 @@
-﻿using CatalogService.Models;
+using CatalogService.Models;
 using Microsoft.EntityFrameworkCore;
 
 namespace CatalogService.Data

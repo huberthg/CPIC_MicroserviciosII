@@ -1,4 +1,4 @@
-﻿using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore;
 using UserService.Data;
 using UserService.DTOs;
 using UserService.Models;
@@ -6,62 +6,16 @@ using BC = BCrypt.Net.BCrypt;
 
 namespace UserService.Services
 {
-    public class UserECService : IUserService
+    // CONTEXTO USUARIOS · solución completa de la Tarea 2.
+    public class UserService : IUserService
     {
         private readonly UserDbContext _context;
-        private readonly ILogger<UserECService> _logger;
-        private readonly string[] _euDomains = { ".es", ".fr", ".de", ".it", ".nl", ".be", ".pt", ".gr", ".pl", ".eu" };
+        private readonly ILogger<UserService> _logger;
 
-        public UserECService(UserDbContext context, ILogger<UserECService> logger)
+        public UserService(UserDbContext context, ILogger<UserService> logger)
         {
             _context = context;
             _logger = logger;
-        }
-
-        public async Task<UserDto> RegisterAsync(RegisterDto dto)
-        {
-            // Verificar si el email ya existe
-            if (await _context.Users.AnyAsync(u => u.Email == dto.Email))
-            {
-                throw new InvalidOperationException("Email ya fue registrado");
-            }
-
-            var user = new User
-            {
-                Email = dto.Email,
-                FirstName = dto.FirstName,
-                LastName = dto.LastName,
-                PasswordHash = BC.HashPassword(dto.Password),
-                Role = "Customer"
-            };
-
-            _context.Users.Add(user);
-            await _context.SaveChangesAsync();
-
-            _logger.LogInformation("Usuario registrado con ID {UserId}", user.Id);
-
-            return MapToDto(user);
-        }
-
-        public async Task<UserDto?> ValidateCredentialsAsync(string email, string password)
-        {
-            var user = await _context.Users.FirstOrDefaultAsync(u => u.Email == email && u.IsActive);
-
-            if (user == null || !BC.Verify(password, user.PasswordHash))
-            {
-                return null;
-            }
-
-            user.LastLogin = DateTime.UtcNow;
-            await _context.SaveChangesAsync();
-
-            return MapToDto(user);
-        }
-
-        public async Task<UserDto?> GetUserByIdAsync(int id)
-        {
-            var user = await _context.Users.FindAsync(id);
-            return user == null ? null : MapToDto(user);
         }
 
         public async Task<List<UserDto>> GetAllUsersAsync()
@@ -72,58 +26,42 @@ namespace UserService.Services
                 .ToListAsync();
         }
 
-        public async Task<bool> ValidateEmailGDPRAsync(int userId)
+        // Un usuario desactivado "no existe" para el resto del sistema: por eso Pedidos
+        // recibe 404 si intenta crear un pedido para él.
+        public async Task<UserDto?> GetUserByIdAsync(int id)
         {
-            var user = await _context.Users.FindAsync(userId);
-            if (user == null)
-                return false;
+            var user = await _context.Users
+                .FirstOrDefaultAsync(u => u.Id == id && u.IsActive);
 
-            // Validar si el email es de un dominio europeo
-            return _euDomains.Any(domain => user.Email.EndsWith(domain, StringComparison.OrdinalIgnoreCase));
+            return user == null ? null : MapToDto(user);
         }
 
-        public async Task<decimal?> GetUserDiscountAsync(int userId)
+        public async Task<UserDto> CreateUserAsync(CreateUserDto dto)
         {
-            var user = await _context.Users.FindAsync(userId);
-            if (user == null)
-                return null;
+            // Verificar si el email ya existe
+            var existingUser = await _context.Users
+                .FirstOrDefaultAsync(u => u.Email == dto.Email);
 
-            // Premium users get 15% discount
-            return user.Role == "Premium" ? 0.15m : 0m;
-        }
-
-        private static UserDto MapToDto(User user)
-        {
-            return new UserDto
+            if (existingUser != null)
             {
-                Id = user.Id,
-                Email = user.Email,
-                FirstName = user.FirstName,
-                LastName = user.LastName,
-                Role = user.Role,
-                IsActive = user.IsActive,
-                CreatedAt = user.CreatedAt
-            };
-        }
+                throw new InvalidOperationException("Email already exists");
+            }
 
-        public async Task<UserDto?> CreateUserAsync(CreateUserDto dto)
-        {
             var user = new User
             {
                 Email = dto.Email,
-                FirstName = dto.Name,
+                Name = dto.Name,
                 LastName = dto.LastName,
-                PasswordHash = BC.HashPassword(dto.Password),
-                Role = dto.Role
+                PasswordHash = BC.HashPassword(dto.Password), // Hash del password
+                CreatedAt = DateTime.UtcNow
             };
 
             _context.Users.Add(user);
             await _context.SaveChangesAsync();
 
-            _logger.LogInformation("Usuario creado con ID {UserId}", user.Id);
+            _logger.LogInformation("User created with ID {UserId}", user.Id);
 
-            return await GetUserByIdAsync(user.Id) ?? throw new InvalidOperationException();
-
+            return MapToDto(user);
         }
 
         public async Task<UserDto?> UpdateUserAsync(int id, UpdateUserDto dto)
@@ -149,13 +87,13 @@ namespace UserService.Services
                 user.Email = dto.Email;
             }
             if (!string.IsNullOrEmpty(dto.Name))
-                user.FirstName = dto.Name;
+                user.Name = dto.Name;
             if (!string.IsNullOrEmpty(dto.LastName))
                 user.LastName = dto.LastName;
             if (!string.IsNullOrEmpty(dto.Password))
                 user.PasswordHash = BC.HashPassword(dto.Password);
 
-            //user.UpdatedAt = DateTime.UtcNow;
+            user.UpdatedAt = DateTime.UtcNow;
 
             // 3. Guardar
             await _context.SaveChangesAsync();
@@ -168,17 +106,31 @@ namespace UserService.Services
         {
             var user = await _context.Users.FindAsync(id);
             if (user == null)
+            {
+                _logger.LogWarning("User {UserId} not found for deletion", id);
                 return false;
+            }
 
+            // Borrado lógico: el usuario deja rastro (pedidos, auditoría); la fila se conserva
             user.IsActive = false;
+            user.UpdatedAt = DateTime.UtcNow;
             await _context.SaveChangesAsync();
-            //_context.Users.Remove(user);
-            //await _context.SaveChangesAsync();
 
             _logger.LogInformation("User {UserId} deleted (soft delete)", id);
-
             return true;
         }
 
+        private static UserDto MapToDto(User user)
+        {
+            return new UserDto
+            {
+                Id = user.Id,
+                Email = user.Email,
+                Name = user.Name,
+                LastName = user.LastName,
+                IsActive = user.IsActive,
+                CreatedAt = user.CreatedAt
+            };
+        }
     }
 }

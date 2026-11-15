@@ -1,31 +1,37 @@
-﻿using CatalogService.Data;
+// ============================================================
+// CatalogService/Program.cs · CONTEXTO CATÁLOGO · puerto 5001 · base CatalogDB
+//
+// Semana 3: Catálogo no cambia de responsabilidad. Solo RESPONDE cuando
+// Pedidos le pregunta por un producto (GET /api/products/{id}).
+// ============================================================
+
+using CatalogService.Data;
 using CatalogService.DTOs;
-using CatalogService.Models;
 using CatalogService.Services;
-using ECommerce.Common.DTOs;
-using ECommerce.Common.Events;
-using ECommerce.Common.Extensions;
 using FluentValidation;
-using MassTransit;
-using MassTransit.Futures.Contracts;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.OpenApi.Models;
 using Serilog;
-using static MassTransit.ValidationResultExtensions;
-
-// Configurar Serilog
-Log.Logger = new LoggerConfiguration()
-    .MinimumLevel.Information()
-    .WriteTo.Console(outputTemplate:
-        "[{Timestamp:HH:mm:ss} {Level:u3}] {Message:lj}{NewLine}{Exception}")
-    .Enrich.FromLogContext()
-    .CreateLogger();
 
 var builder = WebApplication.CreateBuilder(args);
 
-// Configurar Serilog
-// Configurar Serilog
-builder.ConfigureSerilog("ProductService");
+// Configurar Serilog · Semana 5: la consola de siempre y, si hay dirección, Seq (el visor de logs).
+// La dirección llega por configuración: «Seq:Url» en appsettings.json, o «Seq__Url» en el compose (S5-03).
+// Sin dirección, el servicio funciona igual: el visor de logs no es una dependencia.
+var seqUrl = builder.Configuration["Seq:Url"];
+var logConfig = new LoggerConfiguration()
+    .MinimumLevel.Information()
+    .MinimumLevel.Override("Microsoft.AspNetCore", Serilog.Events.LogEventLevel.Warning)
+    .MinimumLevel.Override("Microsoft.EntityFrameworkCore", Serilog.Events.LogEventLevel.Warning)
+    .MinimumLevel.Override("MassTransit", Serilog.Events.LogEventLevel.Warning)
+    .WriteTo.Console(outputTemplate:
+        "[{Timestamp:HH:mm:ss} {Level:u3}] {Message:lj}{NewLine}{Exception}")
+    .Enrich.FromLogContext()
+    // S5-10 · enriquecedor: cada línea dice de qué servicio viene (en Seq: Servicio = 'catalog-service')
+    .Enrich.WithProperty("Servicio", "catalog-service");
+if (!string.IsNullOrWhiteSpace(seqUrl))
+    logConfig.WriteTo.Seq(seqUrl);
+Log.Logger = logConfig.CreateLogger();
 
 // Usar Serilog
 builder.Host.UseSerilog();
@@ -47,27 +53,52 @@ builder.Services.AddSwaggerGen(c =>
     });
 });
 
-// Configurar Entity Framework con SQL Server sin Docker
-/*builder.Services.AddDbContext<CatalogDbContext>(options =>
-    options.UseSqlServer(builder.Configuration.GetConnectionString("DefaultConnection")));
-*/
+// ---- Base de datos: selector de proveedor (S3-13) ----------------------------
+// "Database:Provider" en appsettings.json decide el motor: SqlServer (por omisión) o PostgreSql.
+var provider = builder.Configuration["Database:Provider"] ?? "SqlServer";
+var connectionString = builder.Configuration.GetConnectionString(provider)
+    ?? throw new InvalidOperationException($"Falta ConnectionStrings:{provider} en appsettings.json");
 
 builder.Services.AddDbContext<CatalogDbContext>(options =>
 {
-    var connectionString = builder.Configuration.GetConnectionString("DefaultConnection");
-    options.UseSqlServer(connectionString);
+    if (provider == "PostgreSql")
+        options.UseNpgsql(connectionString);
+    else
+        options.UseSqlServer(connectionString);
 });
 
-// Registrar servicios
+// Registrar servicios y validadores
 builder.Services.AddScoped<IProductService, ProductService>();
 builder.Services.AddValidatorsFromAssemblyContaining<Program>();
 
-// Health checks
-builder.Services.AddHealthChecks()
-    .AddSqlServer(
-        builder.Configuration.GetConnectionString("DefaultConnection") ?? "",
-        name: "database",
-        tags: new[] { "db", "sql", "sqlserver" });
+// S3-11 (extensión opcional de la Semana 3; sigue sin activar) [Catálogo ⇠ evento]
+// Catálogo también puede ESCUCHAR "PedidoCreado" y descontar el stock (consistencia eventual).
+// El consumidor está listo en Consumers/OrderCreatedConsumer.cs; falta registrarlo aquí:
+//
+// builder.Services.AddMassTransit(x =>
+// {
+//     x.AddConsumer<CatalogService.Consumers.OrderCreatedConsumer>();
+//     x.UsingRabbitMq((context, cfg) =>
+//     {
+//         cfg.Host(builder.Configuration["RabbitMQ:Host"] ?? "localhost", "/", h =>
+//         {
+//             h.Username(builder.Configuration["RabbitMQ:Username"] ?? "admin");
+//             h.Password(builder.Configuration["RabbitMQ:Password"] ?? "admin123");
+//         });
+//         // Cola PROPIA de Catálogo: cada contexto recibe su propia copia del evento
+//         cfg.ReceiveEndpoint("order-created-catalog", e =>
+//         {
+//             e.ConfigureConsumer<CatalogService.Consumers.OrderCreatedConsumer>(context);
+//         });
+//     });
+// });
+
+// Health checks (según el proveedor)
+var healthChecks = builder.Services.AddHealthChecks();
+if (provider == "PostgreSql")
+    healthChecks.AddNpgSql(connectionString, name: "database");
+else
+    healthChecks.AddSqlServer(connectionString, name: "database", tags: new[] { "db", "sql", "sqlserver" });
 
 // CORS
 builder.Services.AddCors(options =>
@@ -80,48 +111,25 @@ builder.Services.AddCors(options =>
     });
 });
 
-builder.Services.AddMassTransit(x =>
-{
-    // Configurar consumidores aquí
-
-    x.UsingRabbitMq((context, cfg) =>
-    {
-        // Leer configuración de RabbitMQ
-        var rabbitHost = builder.Configuration["RabbitMQ:Host"] ?? "localhost";
-        var rabbitUser = builder.Configuration["RabbitMQ:Username"] ?? "admin";
-        var rabbitPass = builder.Configuration["RabbitMQ:Password"] ?? "admin123";
-
-        cfg.Host(rabbitHost, "/", h =>
-        {
-            h.Username(rabbitUser);
-            h.Password(rabbitPass);
-        });
-
-        cfg.ConfigureEndpoints(context);
-    });
-});
-
-// NUEVO: Configurar RabbitMQ con MassTransit sin Docker
-/*builder.Services.AddMassTransit(x =>
-{
-    x.UsingRabbitMq((context, cfg) =>
-    {
-        cfg.Host("localhost", "/", h =>
-        {
-            h.Username("admin");
-            h.Password("admin123");
-        });
-
-        // Configuración simple sin consumers
-        cfg.ConfigureEndpoints(context);
-    });
-});
-*/
-
 var app = builder.Build();
 
 // Configurar el pipeline
-app.UseCorrelationId();
+// S5-05 · [Catálogo · logs] CorrelationId: el número de expediente de la petición.
+// Si la petición ya trae el header X-Correlation-Id (porque otro servicio lo mandó), se usa ese;
+// si no, se crea uno nuevo. Se guarda en context.Items (lo lee el HttpClient, S5-05), se devuelve
+// en la respuesta y se mete en el LogContext: desde aquí, CADA línea de log de esta petición
+// lo lleva como propiedad. Va ANTES de UseSerilogRequestLogging, para que esa línea también lo lleve.
+app.Use(async (context, next) =>
+{
+    var correlationId = context.Request.Headers["X-Correlation-Id"].FirstOrDefault()
+                        ?? Guid.NewGuid().ToString("N")[..12];
+    context.Items["CorrelationId"] = correlationId;
+    context.Response.Headers["X-Correlation-Id"] = correlationId;
+    using (Serilog.Context.LogContext.PushProperty("CorrelationId", correlationId))
+    {
+        await next();
+    }
+});
 app.UseSerilogRequestLogging();
 app.UseCors("AllowAll");
 
@@ -135,255 +143,44 @@ if (app.Environment.IsDevelopment())
     });
 }
 
-// Aplicar migraciones automáticamente al iniciar
+// Crear la base al arrancar: migraciones en SQL Server; esquema desde el modelo en PostgreSQL.
+// Semana 4: en contenedores, SQL Server puede tardar 20 a 40 segundos en aceptar conexiones.
+// «Arrancó» no es «está listo» (S4-07): por eso se reintenta cada 3 s, hasta 40 veces (unos 2 minutos), antes de rendirse.
 using (var scope = app.Services.CreateScope())
 {
-    try
+    var dbContext = scope.ServiceProvider.GetRequiredService<CatalogDbContext>();
+    const int maxIntentos = 40;
+    for (var intento = 1; intento <= maxIntentos; intento++)
     {
-        var dbContext = scope.ServiceProvider.GetRequiredService<CatalogDbContext>();
-        dbContext.Database.Migrate();
-        Log.Information("Database migrated successfully");
-    }
-    catch (Exception ex)
-    {
-        Log.Error(ex, "Error migrating database");
+        try
+        {
+            if (provider == "PostgreSql")
+            {
+                dbContext.Database.EnsureCreated();
+                Log.Information("Database created (PostgreSQL, EnsureCreated)");
+            }
+            else
+            {
+                dbContext.Database.Migrate();
+                Log.Information("Database migrated successfully");
+            }
+            break;
+        }
+        catch (Exception ex) when (intento < maxIntentos)
+        {
+            Log.Warning("La base todavía no responde (intento {Intento} de {Max}): {Motivo}. Reintento en 3 s",
+                intento, maxIntentos, ex.GetBaseException().Message);
+            Thread.Sleep(TimeSpan.FromSeconds(3));
+        }
+        catch (Exception ex)
+        {
+            Log.Error(ex, "Error preparing database");
+        }
     }
 }
 
 // ============ ENDPOINTS ============
 
-// GET / api / products - Obtener todos los productos
-app.MapGet("/api/products", async (
-    IProductService catalogService,
-    int pageNumber = 1,
-    int pageSize = 10,
-    string ? category = null,
-    decimal ? minPrice = null,
-    decimal ? maxPrice = null) =>
-{
-    try
-    {
-        var result = await catalogService.GetProductsAsync(
-            pageNumber, pageSize, category, minPrice, maxPrice);
-return Results.Ok(ApiResponse<PagedResponse<ProductDto>>.Ok(result));
-    }
-    catch (Exception ex)
-    {
-        Log.Error(ex, "Error al conseguir los productos");
-return Results.Problem("Un error occurrio mientras se obtenian los productos");
-    }
-})
-.WithName("GetProducts")
-.Produces<ApiResponse<PagedResponse<ProductDto>>>(200)
-.WithOpenApi();
-
-// GET /api/products/{id} - Obtener producto por ID
-app.MapGet("/api/products/{id:int}", async (int id, IProductService catalogService) =>
-{
-    try
-    {
-        var product = await catalogService.GetProductByIdAsync(id);
-        if (product == null)
-            return Results.NotFound(ApiResponse<ProductDto>.Fail($"Producto con ID {id} no se encontro"));
-
-        return Results.Ok(ApiResponse<ProductDto>.Ok(product));
-    }
-    catch (Exception ex)
-    {
-        Log.Error(ex, "Error obteniendo el producto {ProductId}", id);
-        return Results.Problem($"Un error occurrio mientras se obtenia el producto {id}");
-    }
-})
-.WithName("GetProductById")
-.Produces<ApiResponse<ProductDto>>(200)
-.Produces(404)
-.WithOpenApi();
-
-// POST /api/products - Crear nuevo producto
-app.MapPost("/api/products", async (
-    CreateProductDto dto,
-    IProductService catalogService,
-    IValidator<CreateProductDto> validator, 
-    IPublishEndpoint publishEndpoint) =>
-{
-    var validationResult = await validator.ValidateAsync(dto);
-    if (!validationResult.IsValid)
-    {
-        return Results.BadRequest(ApiResponse<ProductDto>.Fail(
-            "Validation fallida",
-            validationResult.Errors.Select(e => e.ErrorMessage).ToList()));
-    }
-
-    try
-    {
-        var product = await catalogService.CreateProductAsync(dto);
-
-        // NUEVO: Publicar evento a RabbitMQ
-        var productEvent = new ProductCreatedEvent
-        {
-            ProductId = product.Id,
-            ProductName = product.Name,
-            Price = product.Price,
-            Message = $"Producto '{product.Name}' creado exitosamente!"
-        };
-
-        await publishEndpoint.Publish(productEvent);
-        Log.Information("✅ Evento ProductCreated publicado a RabbitMQ");
-
-        return Results.Created($"/api/products/{product.Id}",
-            ApiResponse<ProductDto>.Ok(product, "Producto creado y evento publicado"));
-    }
-    catch (Exception ex)
-    {
-        Log.Error(ex, "Error creando el producto");
-        return Results.Problem("Un error occurrio mientras se creaba el producto");
-    }
-})
-.WithName("CreateProduct")
-.Produces<ApiResponse<ProductDto>>(201)
-.Produces(400)
-.WithOpenApi();
-
-// PUT /api/products/{id} - Actualizar producto
-app.MapPut("/api/products/{id:int}", async (
-    int id,
-    UpdateProductDto dto,
-    IProductService catalogService,
-    IValidator<UpdateProductDto> validator) =>
-{
-    var validationResult = await validator.ValidateAsync(dto);
-    if (!validationResult.IsValid)
-    {
-        return Results.BadRequest(ApiResponse<ProductDto>.Fail(
-            "Validacion fallida",
-            validationResult.Errors.Select(e => e.ErrorMessage).ToList()));
-    }
-
-    try
-    {
-        var product = await catalogService.UpdateProductAsync(id, dto);
-        if (product == null)
-            return Results.NotFound(ApiResponse<ProductDto>.Fail($"Producto con ID {id} no se encontro"));
-
-        return Results.Ok(ApiResponse<ProductDto>.Ok(product, "Producto actualizado ok"));
-    }
-    catch (Exception ex)
-    {
-        Log.Error(ex, "Error actualizando producto {ProductId}", id);
-        return Results.Problem($"Un error occurrio mientras se actualizaba el producto {id}");
-    }
-})
-.WithName("UpdateProduct")
-.Produces<ApiResponse<ProductDto>>(200)
-.Produces(404)
-.WithOpenApi();
-
-// DELETE /api/products/{id} - Eliminar producto
-app.MapDelete("/api/products/{id:int}", async (int id, IProductService catalogService) =>
-{
-    try
-    {
-        var result = await catalogService.DeleteProductAsync(id);
-        if (!result)
-            return Results.NotFound(ApiResponse<bool>.Fail($"Producto con ID {id} no se encontro"));
-
-        return Results.Ok(ApiResponse<bool>.Ok(true, "Product borrado ok"));
-    }
-    catch (Exception ex)
-    {
-        Log.Error(ex, "Error borrando el producto {ProductId}", id);
-        return Results.Problem($"Un error occurrio mientras se borraba el producto {id}");
-    }
-})
-.WithName("DeleteProduct")
-.Produces<ApiResponse<bool>>(200)
-.Produces(404)
-.WithOpenApi();
-
-// GET /api/products/search - Buscar productos
-app.MapGet("/api/products/search", async (
-    string query,
-    IProductService catalogService,
-    int pageNumber = 1,
-    int pageSize = 10) =>
-{
-    try
-    {
-        var result = await catalogService.SearchProductsAsync(query, pageNumber, pageSize);
-        return Results.Ok(ApiResponse<PagedResponse<ProductDto>>.Ok(result));
-    }
-    catch (Exception ex)
-    {
-        Log.Error(ex, "Error buscando productos con la consulta: {Query}", query);
-        return Results.Problem("Un error occurrio mientras se buscaban productos");
-    }
-})
-.WithName("SearchProducts")
-.Produces<ApiResponse<PagedResponse<ProductDto>>>(200)
-.WithOpenApi();
-
-// GET /api/products/{id}/stock - Verificar stock
-app.MapGet("/api/products/{id:int}/stock", async (int id, IProductService catalogService) =>
-{
-    try
-    {
-        var stock = await catalogService.GetProductStockAsync(id);
-        if (stock == null)
-            return Results.NotFound(ApiResponse<int>.Fail($"Producto con ID {id} no se encontro"));
-
-        return Results.Ok(ApiResponse<int>.Ok(stock.Value));
-    }
-    catch (Exception ex)
-    {
-        Log.Error(ex, "Error obteniendo el stock del producto {ProductId}", id);
-        return Results.Problem($"Un error occurrio mientras se obtenia el stock del producto {id}");
-    }
-})
-.WithName("GetProductStock")
-.Produces<ApiResponse<int>>(200)
-.Produces(404)
-.WithOpenApi();
-
-// NUEVO: Endpoint de prueba para publicar mensaje simple
-app.MapPost("/api/test/publish-message", async (
-    IPublishEndpoint publishEndpoint,
-    string? message = null) =>
-{
-    var testMessage = message ?? "Hola Mundo desde CatalogService!";
-
-    var testEvent = new ProductCreatedEvent
-    {
-        ProductId = 999,
-        ProductName = "Producto de Prueba",
-        Price = 123.45m,
-        Message = testMessage
-    };
-
-    await publishEndpoint.Publish(testEvent);
-
-    Log.Information("📤 Mensaje de prueba publicado: {Message}", testMessage);
-
-    return Results.Ok(new
-    {
-        success = true,
-        message = "Mensaje publicado a RabbitMQ",
-        eventData = testEvent
-    });
-})
-.WithName("TestPublishMessage")
-.WithOpenApi();
-
-// Endpoint de prueba
-app.MapPost("/api/test/send", async (IPublishEndpoint publisher) =>
-{
-    await publisher.Publish(new TestMessageEvent
-    {
-        Message = "Hola desde CatalogService!"
-    });
-    return Results.Ok("Mensaje enviado");
-});
-
-/*
 // GET /api/products - Obtener todos los productos
 app.MapGet("/api/products", async (IProductService productService) =>
 {
@@ -404,6 +201,7 @@ app.MapGet("/api/products", async (IProductService productService) =>
 .Produces(StatusCodes.Status500InternalServerError);
 
 // GET /api/products/{id} - Obtener producto por ID
+// (Es el endpoint que Pedidos consulta en la Semana 3: "¿cuánto vale el producto {id}?")
 app.MapGet("/api/products/{id:int}", async (int id, IProductService productService) =>
 {
     try
@@ -425,18 +223,22 @@ app.MapGet("/api/products/{id:int}", async (int id, IProductService productServi
 .Produces<ApiResponse<ProductDto>>(StatusCodes.Status200OK)
 .Produces(StatusCodes.Status404NotFound);
 
-// POST /api/products - Crear nuevo producto
-app.MapPost("/api/products", async (CreateProductDto dto, IProductService productService) =>
+// POST /api/products - Crear nuevo producto (con FluentValidation, Demo 2 de la Semana 2)
+app.MapPost("/api/products", async (
+    CreateProductDto dto,
+    IProductService productService,
+    IValidator<CreateProductDto> validator) =>
 {
+    var validation = await validator.ValidateAsync(dto);
+    if (!validation.IsValid)
+    {
+        return Results.BadRequest(ApiResponse<ProductDto>.Fail(
+            "Validation failed",
+            validation.Errors.Select(e => e.ErrorMessage).ToList()));
+    }
+
     try
     {
-        // Validación básica
-        if (string.IsNullOrEmpty(dto.Name))
-            return Results.BadRequest(ApiResponse<ProductDto>.Fail("Product name is required"));
-
-        if (dto.Price <= 0)
-            return Results.BadRequest(ApiResponse<ProductDto>.Fail("Price must be greater than 0"));
-
         var product = await productService.CreateProductAsync(dto);
         return Results.Created($"/api/products/{product.Id}",
             ApiResponse<ProductDto>.Ok(product, "Product created successfully"));
@@ -496,7 +298,7 @@ app.MapDelete("/api/products/{id:int}", async (int id, IProductService productSe
 .Produces<ApiResponse<bool>>(StatusCodes.Status200OK)
 .Produces(StatusCodes.Status404NotFound);
 
-// GET /api/products/search?term={term} - Buscar productos --REUSE Later
+// GET /api/products/search?term={term} - Buscar productos
 app.MapGet("/api/products/search", async (string term, IProductService productService) =>
 {
     try
@@ -513,17 +315,18 @@ app.MapGet("/api/products/search", async (string term, IProductService productSe
 .WithName("SearchProducts")
 .WithOpenApi()
 .Produces<ApiResponse<List<ProductDto>>>(StatusCodes.Status200OK);
-*/
 
 // Health check endpoint
 app.MapHealthChecks("/health");
 
 // Endpoint de información
-app.MapGet("/", () => new
+app.MapGet("/info", () => new
 {
     Service = "Catalog Service",
+    Context = "Catálogo",
     Version = "1.0.0",
     Status = "Running",
+    Database = provider,
     Endpoints = new[]
     {
         "GET /api/products",
@@ -531,17 +334,14 @@ app.MapGet("/", () => new
         "POST /api/products",
         "PUT /api/products/{id}",
         "DELETE /api/products/{id}",
-        "get /api/products/search",
-        //"GET /api/products/search?term={term}",
-        "GET /api/products/{id:int}/stock",
-        "GET /health",
-        "POST /api/test/publish-message"
+        "GET /api/products/search?term={term}",
+        "GET /health"
     },
-    Documentation = "/swagger"
+    Documentation = "/ (Swagger UI)"
 });
 
-Console.WriteLine("🚀 Sistema E-Commerce Microservicio Catalogo de Productos iniciado");
-Console.WriteLine("📍 Swagger disponible en: https://localhost:7001/swagger");
+Console.WriteLine("Microservicio de Catálogo de Productos iniciado");
+Console.WriteLine("Swagger disponible en: http://localhost:5001 (o https://localhost:7001)");
 app.Run();
 
 // Hacer la clase Program testeable

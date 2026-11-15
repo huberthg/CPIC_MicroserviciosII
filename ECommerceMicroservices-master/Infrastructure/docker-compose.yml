@@ -1,26 +1,28 @@
-version: '3.8'
+# ECommerceGRPC · Clase 2 · Microservicios Resilientes (Nivel 2) · kit «estudiante»
+#
+#   docker compose up -d --build     → levanta todo (siempre con --build: así Docker usa SU código, no una imagen vieja)
+#   docker compose ps                → estado de cada servicio
+#   docker compose logs -f gateway   → mensajes del gateway
+#   docker compose down              → apaga (los datos se conservan)
+#
+# Afuera (su máquina)               Adentro (la red de Docker)
+#   Gateway REST + Swagger  localhost:5000   gateway:5000        ← lo único que usa un cliente
+#   Productos gRPC          localhost:7001   product-grpc:7001
+#   Usuarios gRPC           localhost:7002   user-grpc:7002
+#   Pedidos gRPC            localhost:7003   order-grpc:7003
+#   Catálogo REST (Nivel 1) localhost:5001   catalog-service:8080
+#   Usuarios REST (Nivel 1) localhost:5002   user-service:8080
+#   SQL Server              localhost,1434   sqlserver,1433      sa / Password123!
+#
+# Este kit usa su propio nombre de proyecto y sus propias imágenes (etiqueta :c2).
+# Antes de levantarlo, apague cualquier otro kit del curso: comparten los puertos.
+name: ecommerce-grpc-c2
 
 services:
-  rabbitmq:
-    image: rabbitmq:3-management
-    container_name: microservices-rabbitmq
-    environment:
-      - RABBITMQ_DEFAULT_USER=admin
-      - RABBITMQ_DEFAULT_PASS=admin123
-    ports:
-      - "5672:5672"    # AMQP
-      - "15672:15672"  # Management UI
-    networks:
-      - microservices-network
-    healthcheck:
-      test: ["CMD", "rabbitmq-diagnostics", "ping"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-  # SQL Server 2019
+
   sqlserver:
     image: mcr.microsoft.com/mssql/server:2019-latest
-    container_name: microservices-sqlserver
+    container_name: c2-sqlserver
     environment:
       - ACCEPT_EULA=Y
       - SA_PASSWORD=Password123!
@@ -29,143 +31,119 @@ services:
       - "1434:1433"
     volumes:
       - sqlserver-data:/var/opt/mssql
-    networks:
-      - microservices-network
-    restart: unless-stopped
-  # ⚠️ HEALTHCHECK SIMPLIFICADO - SIN SQLCMD
     healthcheck:
-      test: ["CMD-SHELL", "timeout 1 bash -c '</dev/tcp/localhost/1433' || exit 1"]
-      interval: 10s
+      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P 'Password123!' -C -Q 'SELECT 1' -b -o /dev/null"]
+      interval: 5s
       timeout: 5s
-      retries: 5
-      start_period: 30s
+      retries: 20
+      start_period: 20s
 
-  # RabbitMQ con Management UI
-  #rabbitmq:
-   # image: rabbitmq:3-management
-    #container_name: microservices-rabbitmq
-    #environment:
-     # - RABBITMQ_DEFAULT_USER=admin
-      #- RABBITMQ_DEFAULT_PASS=admin123
-    #ports:
-     # - "5672:5672"    # Para conexión
-     # - "15672:15672"  # Para Management UI
-    #volumes:
-     # - rabbitmq-data:/var/lib/rabbitmq
-    #networks:
-     # - microservices-network
-    #restart: unless-stopped
-
-  # Redis
-  redis:
-    image: redis:7-alpine
-    container_name: microservices-redis
-    ports:
-      - "6379:6379"
-    volumes:
-      - redis-data:/data
-    networks:
-      - microservices-network
-    restart: unless-stopped
-    
-  # ====================================
-  # MICROSERVICIOS
-  # ====================================
-
-  # Catalog Service
+  # REST del Nivel 1. Al arrancar crea CatalogDB con 3 productos.
   catalog-service:
     build:
-      context: ..                    # ← Contexto en la raíz (nivel de la solución)
-      dockerfile: CatalogService/Dockerfile  # ← Ruta al Dockerfile desde la raíz
-    container_name: catalog-service
+      context: ..
+      dockerfile: CatalogService/Dockerfile
+    image: ecommerce-grpc/catalog-service:c2
+    container_name: c2-catalog-rest
     environment:
       - ASPNETCORE_ENVIRONMENT=Development
-      - ASPNETCORE_URLS=http://+:80
-      # ⚠️ IMPORTANTE: Dentro de Docker, usa 'sqlserver' no 'localhost'
-      - ConnectionStrings__DefaultConnection=Server=sqlserver,1433;Database=CatalogDB;User Id=sa;Password=Password123!;TrustServerCertificate=True;
-      # ⚠️ IMPORTANTE: Dentro de Docker, usa 'rabbitmq' no 'localhost'
-      - RabbitMQ__Host=rabbitmq
-      - RabbitMQ__Username=admin
-      - RabbitMQ__Password=admin123
+      - ConnectionStrings__SqlServer=Server=sqlserver,1433;Database=CatalogDB;User Id=sa;Password=Password123!;TrustServerCertificate=True;Encrypt=False
+      - Seq__Url=
+      - Demo__ProductoLentoId=0
     ports:
-      - "5001:80"
+      - "5001:8080"
     depends_on:
       sqlserver:
         condition: service_healthy
-      rabbitmq:
-        condition: service_healthy
-    networks:
-      - microservices-network
-    restart: unless-stopped
-    volumes:
-      # Mapear carpeta de logs (opcional)
-      - ./logs/catalog:/app/logs
-      
-# =============================================
-  # USER SERVICE
-  # =============================================
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  # REST del Nivel 1. Al arrancar crea UserDB con 2 usuarios.
   user-service:
     build:
       context: ..
       dockerfile: UserService/Dockerfile
-    container_name: user-service
+    image: ecommerce-grpc/user-service:c2
+    container_name: c2-user-rest
     environment:
       - ASPNETCORE_ENVIRONMENT=Development
-      - ASPNETCORE_URLS=http://+:80
-      - ConnectionStrings__DefaultConnection=Server=sqlserver,1433;Database=UserDB;User Id=sa;Password=Password123!;TrustServerCertificate=True;
-      - RabbitMQ__Host=rabbitmq
-      - RabbitMQ__Username=admin
-      - RabbitMQ__Password=admin123
+      - ConnectionStrings__SqlServer=Server=sqlserver,1433;Database=UserDB;User Id=sa;Password=Password123!;TrustServerCertificate=True;Encrypt=False
+      - Seq__Url=
     ports:
-      - "5002:80"
+      - "5002:8080"
     depends_on:
       sqlserver:
         condition: service_healthy
-      rabbitmq:
-        condition: service_healthy
-    networks:
-      - microservices-network
-    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
 
-  # =============================================
-  # ORDER SERVICE
-  # =============================================
-  order-service:
+  product-grpc:
     build:
-      context: ..
-      dockerfile: OrderService/Dockerfile
-    container_name: order-service
+      context: ../ProductService.gRPC
+    image: ecommerce-grpc/product-grpc:c2
+    container_name: c2-product-grpc
+    environment:
+      - ConnectionStrings__SqlServer=Server=sqlserver,1433;Database=CatalogDB;User Id=sa;Password=Password123!;TrustServerCertificate=True;Encrypt=False
+    ports:
+      - "7001:7001"
+    depends_on:
+      catalog-service:
+        condition: service_healthy
+
+  # En la Clase 2 Usuarios gRPC arranca siempre (ya no lleva --profile usuarios).
+  user-grpc:
+    build:
+      context: ../UserService.gRPC
+    image: ecommerce-grpc/user-grpc:c2
+    container_name: c2-user-grpc
+    environment:
+      - ConnectionStrings__SqlServer=Server=sqlserver,1433;Database=UserDB;User Id=sa;Password=Password123!;TrustServerCertificate=True;Encrypt=False
+    ports:
+      - "7002:7002"
+    depends_on:
+      user-service:
+        condition: service_healthy
+
+  # Nuevo en la Clase 2: valida pedidos llamando a Usuarios y a Productos.
+  order-grpc:
+    build:
+      context: ../OrderService.gRPC
+    image: ecommerce-grpc/order-grpc:c2
+    container_name: c2-order-grpc
+    environment:
+      - GrpcServicios__Usuarios=http://user-grpc:7002
+      - GrpcServicios__Productos=http://product-grpc:7001
+    ports:
+      - "7003:7003"
+    depends_on:
+      - product-grpc
+      - user-grpc
+
+  # Nuevo en la Clase 2: la única puerta de entrada para los clientes REST.
+  gateway:
+    build:
+      context: ../ApiGateway.BFF
+    image: ecommerce-grpc/api-gateway:c2
+    container_name: c2-gateway
     environment:
       - ASPNETCORE_ENVIRONMENT=Development
-      - ASPNETCORE_URLS=http://+:80
-      - ConnectionStrings__DefaultConnection=Server=sqlserver,1433;Database=OrderDB;User Id=sa;Password=Password123!;TrustServerCertificate=True;
-      - RabbitMQ__Host=rabbitmq
-      - RabbitMQ__Username=admin
-      - RabbitMQ__Password=admin123
-      - ServiceUrls__UserService=http://user-service
-      - ServiceUrls__CatalogService=http://catalog-service
-      - Redis__Configuration=redis:6379
+      - GrpcServicios__Productos=http://product-grpc:7001
+      - GrpcServicios__Usuarios=http://user-grpc:7002
+      - GrpcServicios__Pedidos=http://order-grpc:7003
     ports:
-      - "5003:80"
+      - "5000:5000"
     depends_on:
-      sqlserver:
-        condition: service_healthy
-      rabbitmq:
-        condition: service_healthy
-      #redis:
-       # condition: service_healthy
-    networks:
-      - microservices-network
-    restart: unless-stopped      
+      - product-grpc
+      - user-grpc
+      - order-grpc
 
 volumes:
   sqlserver-data:
-    driver: local
-  rabbitmq-data:
-    driver: local
-  redis-data:
-    driver: local
-
-networks:
-  microservices-network:
-    driver: bridge

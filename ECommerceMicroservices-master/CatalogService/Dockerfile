@@ -1,43 +1,54 @@
-# =============================================
-# ETAPA 1: Base - Imagen de runtime
-# =============================================
+# =====================================================================
+# CatalogService/Dockerfile 路 CONTEXTO CAT脕LOGO 路 Semana 4 (S4-02)
+#
+# La RECETA de la imagen de Cat谩logo. Se construye desde la RA脥Z de la
+# soluci贸n, no desde esta carpeta, porque Cat谩logo usa el proyecto
+# ECommerce.Contracts y Docker solo ve lo que est谩 dentro del contexto:
+#
+#     docker build -t catalog-service:s4 -f CatalogService/Dockerfile .
+#                                                                     ^ el contexto: la ra铆z
+#
+# Cuatro etapas (multi-etapa): base 路 build 路 publish 路 final.
+# Solo la 煤ltima es la imagen que corre: lleva el runtime y lo publicado,
+# no el SDK con el que se compil贸.
+#
+# S4-03: el Dockerfile de Usuarios y el de Pedidos se hacen COPIANDO este
+# archivo. Cambian TRES l铆neas, marcadas abajo con 芦CAMBIA禄.
+# =====================================================================
+
+# ---- Etapa 1 路 base: el runtime de ASP.NET Core 8 (sin compilador) -------
 FROM mcr.microsoft.com/dotnet/aspnet:8.0 AS base
 WORKDIR /app
-EXPOSE 80
-EXPOSE 443
+# Adentro del contenedor, .NET 8 escucha en el puerto 8080.
+# Afuera, docker-compose.yml lo publica como 5001 ("5001:8080").
+EXPOSE 8080
+# curl: lo usan el healthcheck (S4-13) y la prueba de red por nombre (S4-08)
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl \
+    && rm -rf /var/lib/apt/lists/*
 
-# =============================================
-# ETAPA 2: Build - Compilaci髇
-# =============================================
+# ---- Etapa 2 路 build: el SDK completo, solo para compilar ----------------
 FROM mcr.microsoft.com/dotnet/sdk:8.0 AS build
-ARG BUILD_CONFIGURATION=Release
 WORKDIR /src
-
-# Copiar SOLO los archivos .csproj primero (para cache de restore)
+# Primero SOLO los .csproj y el restore. Mientras las dependencias no
+# cambien, Docker reutiliza esta capa (cach茅) y el build tarda segundos.
+COPY ["ECommerce.Contracts/ECommerce.Contracts.csproj", "ECommerce.Contracts/"]
+# CAMBIA (1 de 3): la carpeta y el .csproj del servicio
 COPY ["CatalogService/CatalogService.csproj", "CatalogService/"]
-COPY ["ECommerce.Common/ECommerce.Common.csproj", "ECommerce.Common/"]
+# CAMBIA (2 de 3): la carpeta de trabajo del servicio
+WORKDIR /src/CatalogService
+RUN dotnet restore
+# Ahora s铆, todo el c贸digo (lo que .dockerignore deja pasar)
+COPY . /src/
+RUN dotnet build -c Release -o /app/build
 
-# Restaurar dependencias
-RUN dotnet restore "CatalogService/CatalogService.csproj"
-
-# Copiar TODO el c骴igo fuente
-COPY . .
-
-# Compilar
-WORKDIR "/src/CatalogService"
-RUN dotnet build "CatalogService.csproj" -c $BUILD_CONFIGURATION -o /app/build
-
-# =============================================
-# ETAPA 3: Publish - Publicaci髇
-# =============================================
+# ---- Etapa 3 路 publish: deja solo lo necesario para correr --------------
 FROM build AS publish
-ARG BUILD_CONFIGURATION=Release
-RUN dotnet publish "CatalogService.csproj" -c $BUILD_CONFIGURATION -o /app/publish /p:UseAppHost=false
+RUN dotnet publish -c Release -o /app/publish /p:UseAppHost=false
 
-# =============================================
-# ETAPA 4: Final - Imagen final
-# =============================================
+# ---- Etapa 4 路 final: runtime + lo publicado. ESTA es la imagen ----------
 FROM base AS final
 WORKDIR /app
 COPY --from=publish /app/publish .
+# CAMBIA (3 de 3): el .dll que se ejecuta
 ENTRYPOINT ["dotnet", "CatalogService.dll"]

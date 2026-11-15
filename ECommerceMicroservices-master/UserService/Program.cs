@@ -1,93 +1,79 @@
-﻿using System.ComponentModel.DataAnnotations;
-using System.IdentityModel.Tokens.Jwt;
-using System.Security.Claims;
-using System.Text;
-using ECommerce.Common.DTOs;
-using ECommerce.Common.Extensions;
+// ============================================================
+// UserService/Program.cs · CONTEXTO USUARIOS · puerto 5002 · base UserDB
+//
+// Semana 3: Usuarios ya está completo (es la solución de la Tarea 2).
+// Su papel esta semana es RESPONDER cuando Pedidos pregunta
+// "¿existe el usuario {id}?" con GET /api/users/{id}: 200 si existe y está
+// activo, 404 si no. Nada más cambia.
+// ============================================================
+
 using FluentValidation;
-using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.EntityFrameworkCore;
-using Microsoft.IdentityModel.Tokens;
+using Microsoft.OpenApi.Models;
 using Serilog;
 using UserService.Data;
 using UserService.DTOs;
-using UserService.Models;
 using UserService.Services;
-using UserService.Services.Data;
-using BC = BCrypt.Net.BCrypt;
-using MassTransit;
-using ECommerce.Common.Events;
 
 var builder = WebApplication.CreateBuilder(args);
 
-Log.Logger = new LoggerConfiguration()
+// Configurar Serilog · Semana 5: la consola de siempre y, si hay dirección, Seq (el visor de logs).
+// La dirección llega por configuración: «Seq:Url» en appsettings.json, o «Seq__Url» en el compose (S5-03).
+// Sin dirección, el servicio funciona igual: el visor de logs no es una dependencia.
+var seqUrl = builder.Configuration["Seq:Url"];
+var logConfig = new LoggerConfiguration()
     .MinimumLevel.Information()
+    .MinimumLevel.Override("Microsoft.AspNetCore", Serilog.Events.LogEventLevel.Warning)
+    .MinimumLevel.Override("Microsoft.EntityFrameworkCore", Serilog.Events.LogEventLevel.Warning)
+    .MinimumLevel.Override("MassTransit", Serilog.Events.LogEventLevel.Warning)
     .WriteTo.Console(outputTemplate:
         "[{Timestamp:HH:mm:ss} {Level:u3}] {Message:lj}{NewLine}{Exception}")
     .Enrich.FromLogContext()
-    .CreateLogger();
-
-//var builder = WebApplication.CreateBuilder(args);
+    // S5-10 · enriquecedor: cada línea dice de qué servicio viene (en Seq: Servicio = 'user-service')
+    .Enrich.WithProperty("Servicio", "user-service");
+if (!string.IsNullOrWhiteSpace(seqUrl))
+    logConfig.WriteTo.Seq(seqUrl);
+Log.Logger = logConfig.CreateLogger();
 
 // Usar Serilog
 builder.Host.UseSerilog();
-
-
-// Configurar Serilog
-builder.ConfigureSerilog("UserService");
-
-//Configurar JWT
-var jwtSettings = builder.Configuration.GetSection("JwtSettings");
-var secretKey = Encoding.UTF8.GetBytes(jwtSettings["SecretKey"] ?? "SuperSecretKey123!@#ForDevelopmentOnly");
-
-builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
-    .AddJwtBearer(options =>
-    {
-        options.TokenValidationParameters = new TokenValidationParameters
-        {
-            ValidateIssuer = true,
-            ValidateAudience = true,
-            ValidateLifetime = true,
-            ValidateIssuerSigningKey = true,
-            ValidIssuer = jwtSettings["Issuer"],
-            ValidAudience = jwtSettings["Audience"],
-            IssuerSigningKey = new SymmetricSecurityKey(secretKey)
-        };
-    });
-
-builder.Services.AddAuthorization();
 
 // Agregar servicios
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen(c =>
 {
-    c.SwaggerDoc("v1", new() { Title = "User Service API", Version = "v1" });
-    c.AddSecurityDefinition("Bearer", new()
+    c.SwaggerDoc("v1", new OpenApiInfo
     {
-        Description = "JWT Authorization header using the Bearer scheme",
-        Name = "Authorization",
-        In = Microsoft.OpenApi.Models.ParameterLocation.Header,
-        Type = Microsoft.OpenApi.Models.SecuritySchemeType.ApiKey,
-        Scheme = "Bearer"
+        Title = "User Service API",
+        Version = "v1",
+        Description = "Microservicio de Gestión de Usuarios"
     });
 });
 
-// Configurar Entity Framework sin dccker
-//builder.Services.AddDbContext<UserDbContext>(options =>
-//    options.UseSqlServer(builder.Configuration.GetConnectionString("DefaultConnection")));
+// ---- Base de datos: selector de proveedor (S3-13) ----------------------------
+// "Database:Provider" en appsettings.json decide el motor: SqlServer (por omisión) o PostgreSql.
+var provider = builder.Configuration["Database:Provider"] ?? "SqlServer";
+var connectionString = builder.Configuration.GetConnectionString(provider)
+    ?? throw new InvalidOperationException($"Falta ConnectionStrings:{provider} en appsettings.json");
+
 builder.Services.AddDbContext<UserDbContext>(options =>
 {
-    var connectionString = builder.Configuration.GetConnectionString("DefaultConnection");
-    options.UseSqlServer(connectionString);
+    if (provider == "PostgreSql")
+        options.UseNpgsql(connectionString);
+    else
+        options.UseSqlServer(connectionString);
 });
 
-// Registrar servicios
-builder.Services.AddScoped<IUserService, UserECService>();
-builder.Services.AddScoped<ITokenService, TokenService>();
+// Registrar servicios y validadores (Tarea 2)
+builder.Services.AddScoped<IUserService, UserService.Services.UserService>();
 builder.Services.AddValidatorsFromAssemblyContaining<Program>();
 
-// Health checks
-builder.Services.AddStandardHealthChecks(builder.Configuration.GetConnectionString("DefaultConnection"));
+// Health checks (según el proveedor)
+var healthChecks = builder.Services.AddHealthChecks();
+if (provider == "PostgreSql")
+    healthChecks.AddNpgSql(connectionString, name: "database");
+else
+    healthChecks.AddSqlServer(connectionString, name: "database");
 
 // CORS
 builder.Services.AddCors(options =>
@@ -100,419 +86,186 @@ builder.Services.AddCors(options =>
     });
 });
 
-
-builder.Services.AddMassTransit(x =>
-{
-    // Configurar consumidores aquí
-    x.AddConsumer<ProductCreatedConsumer>();
-    x.AddConsumer<TestMessageConsumer>();
-
-    x.UsingRabbitMq((context, cfg) =>
-    {
-        // Leer configuración de RabbitMQ
-        var rabbitHost = builder.Configuration["RabbitMQ:Host"] ?? "localhost";
-        var rabbitUser = builder.Configuration["RabbitMQ:Username"] ?? "admin";
-        var rabbitPass = builder.Configuration["RabbitMQ:Password"] ?? "admin123";
-
-        cfg.Host(rabbitHost, "/", h =>
-        {
-            h.Username(rabbitUser);
-            h.Password(rabbitPass);
-        });
-
-        // Configurar el consumer
-        cfg.ReceiveEndpoint("user-service-queue", e =>
-        {
-            e.ConfigureConsumer<ProductCreatedConsumer>(context);
-        });
-
-        cfg.ReceiveEndpoint("test-queue", e =>
-        {
-            e.ConfigureConsumer<TestMessageConsumer>(context);
-        });
-        //cfg.ConfigureEndpoints(context);
-    });
-});
-
-
-//sin docker
-//builder.Services.AddMassTransit(x =>
-//{
-//    // Registrar el consumer
-//    x.AddConsumer<ProductCreatedConsumer>();
-//    x.AddConsumer<TestMessageConsumer>();
-
-//    x.UsingRabbitMq((context, cfg) =>
-//    {
-//        cfg.Host("localhost", "/", h =>
-//        {
-//            h.Username("admin");
-//            h.Password("admin123");
-//        });
-
-//        // Configurar el consumer
-//        cfg.ReceiveEndpoint("user-service-queue", e =>
-//        {
-//            e.ConfigureConsumer<ProductCreatedConsumer>(context);
-//        });
-
-//        cfg.ReceiveEndpoint("test-queue", e =>
-//        {
-//            e.ConfigureConsumer<TestMessageConsumer>(context);
-//        });
-//    });
-//});
-
 var app = builder.Build();
 
-// Middleware pipeline
-app.UseCorrelationId();
+// Configurar el pipeline
+// S5-05 · [Usuarios · logs] CorrelationId: el número de expediente de la petición.
+// Si la petición ya trae el header X-Correlation-Id (porque otro servicio lo mandó), se usa ese;
+// si no, se crea uno nuevo. Se guarda en context.Items (lo lee el HttpClient, S5-05), se devuelve
+// en la respuesta y se mete en el LogContext: desde aquí, CADA línea de log de esta petición
+// lo lleva como propiedad. Va ANTES de UseSerilogRequestLogging, para que esa línea también lo lleve.
+app.Use(async (context, next) =>
+{
+    var correlationId = context.Request.Headers["X-Correlation-Id"].FirstOrDefault()
+                        ?? Guid.NewGuid().ToString("N")[..12];
+    context.Items["CorrelationId"] = correlationId;
+    context.Response.Headers["X-Correlation-Id"] = correlationId;
+    using (Serilog.Context.LogContext.PushProperty("CorrelationId", correlationId))
+    {
+        await next();
+    }
+});
+app.UseSerilogRequestLogging();
 app.UseCors("AllowAll");
-app.UseAuthentication();
-app.UseAuthorization();
 
 if (app.Environment.IsDevelopment())
 {
     app.UseSwagger();
-    app.UseSwaggerUI();
+    app.UseSwaggerUI(c =>
+    {
+        c.SwaggerEndpoint("/swagger/v1/swagger.json", "User Service API v1");
+        c.RoutePrefix = string.Empty; // Swagger en la raíz
+    });
 }
 
-// Aplicar migraciones automáticamente
+// Crear la base al arrancar: migraciones en SQL Server; esquema desde el modelo en PostgreSQL.
+// Semana 4: en contenedores, SQL Server puede tardar 20 a 40 segundos en aceptar conexiones.
+// «Arrancó» no es «está listo» (S4-07): por eso se reintenta cada 3 s, hasta 40 veces (unos 2 minutos), antes de rendirse.
 using (var scope = app.Services.CreateScope())
 {
     var dbContext = scope.ServiceProvider.GetRequiredService<UserDbContext>();
-    dbContext.Database.Migrate();
-
-    // Seed data si está vacío
-    if (!dbContext.Users.Any())
+    const int maxIntentos = 40;
+    for (var intento = 1; intento <= maxIntentos; intento++)
     {
-        DataSeeder.SeedUsers(dbContext);
+        try
+        {
+            if (provider == "PostgreSql")
+            {
+                dbContext.Database.EnsureCreated();
+                Log.Information("Database created (PostgreSQL, EnsureCreated)");
+            }
+            else
+            {
+                dbContext.Database.Migrate();
+                Log.Information("Database migrated successfully");
+            }
+            break;
+        }
+        catch (Exception ex) when (intento < maxIntentos)
+        {
+            Log.Warning("La base todavía no responde (intento {Intento} de {Max}): {Motivo}. Reintento en 3 s",
+                intento, maxIntentos, ex.GetBaseException().Message);
+            Thread.Sleep(TimeSpan.FromSeconds(3));
+        }
+        catch (Exception ex)
+        {
+            Log.Error(ex, "Error preparing database");
+        }
     }
 }
-///////////////////////////////con JWT/////////////////////////////////////
-#region SIN JWT
-///////////////////////////////SIN JWT/////////////////////////////////////
-//// Configurar Serilog
-//Log.Logger = new LoggerConfiguration()
-//    .MinimumLevel.Information()
-//    .WriteTo.Console(outputTemplate:
-//        "[{Timestamp:HH:mm:ss} {Level:u3}] {Message:lj}{NewLine}{Exception}")
-//    .Enrich.FromLogContext()
-//    .CreateLogger();
-
-//var builder = WebApplication.CreateBuilder(args);
-
-// Usar Serilog
-//builder.Host.UseSerilog();
-
-//// Agregar servicios
-//builder.Services.AddEndpointsApiExplorer();
-//builder.Services.AddSwaggerGen(c =>
-//{
-//    c.SwaggerDoc("v1", new()
-//    {
-//        Title = "User Service API",
-//        Version = "v1",
-//        Description = "Microservicio de Gestión de Usuarios - TAREA 1"
-//    });
-//});
-
-//// Configurar Entity Framework
-//builder.Services.AddDbContext<UserDbContext>(options =>
-//    options.UseSqlServer(builder.Configuration.GetConnectionString("DefaultConnection")));
-
-//// Registrar servicios
-//builder.Services.AddScoped<IUserService, UserService.Services.UserECService>();
-
-//// Registrar validadores cuando los implementen
-//builder.Services.AddValidatorsFromAssemblyContaining<Program>();
-
-//// Health checks
-//builder.Services.AddHealthChecks()
-//    .AddSqlServer(
-//        builder.Configuration.GetConnectionString("DefaultConnection") ?? "",
-//        name: "database");
-
-//// CORS
-//builder.Services.AddCors(options =>
-//{
-//    options.AddPolicy("AllowAll", policy =>
-//    {
-//        policy.AllowAnyOrigin()
-//              .AllowAnyMethod()
-//              .AllowAnyHeader();
-//    });
-//});
-
-//var app = builder.Build();
-
-//// Configurar el pipeline
-//app.UseSerilogRequestLogging();
-//app.UseCors("AllowAll");
-
-//if (app.Environment.IsDevelopment())
-//{
-//    app.UseSwagger();
-//    app.UseSwaggerUI(c =>
-//    {
-//        c.SwaggerEndpoint("/swagger/v1/swagger.json", "User Service API v1");
-//        c.RoutePrefix = string.Empty;
-//    });
-//}
-
-//// Aplicar migraciones automáticamente
-//using (var scope = app.Services.CreateScope())
-//{
-//    var dbContext = scope.ServiceProvider.GetRequiredService<UserDbContext>();
-//    dbContext.Database.Migrate();
-
-//    // Seed data si está vacío
-//    if (!dbContext.Users.Any())
-//    {
-//        DataSeeder.SeedUsers(dbContext);
-//    }
-//}
-#endregion SIN JWT
-///////////////////////////////SIN JWT/////////////////////////////////////
 
 // ============================================
 // ENDPOINTS
 // ============================================
 
-// POST /api/auth/register - Registro de usuario
-app.MapPost("/api/auth/register", async (
-    RegisterDto dto,
-    IUserService userService,
-    IValidator<RegisterDto> validator) =>
-{
-    var validationResult = await validator.ValidateAsync(dto);
-    if (!validationResult.IsValid)
-    {
-        return Results.BadRequest(ApiResponse<UserDto>.Fail(
-            "Validation fallida",
-            validationResult.Errors.Select(e => e.ErrorMessage).ToList()));
-    }
-
-    try
-    {
-        var user = await userService.RegisterAsync(dto);
-        return Results.Created($"/api/users/{user.Id}",
-            ApiResponse<UserDto>.Ok(user, "User registrado ok"));
-    }
-    catch (Exception ex)
-    {
-        Log.Error(ex, "Error al registrar el usuario");
-        return Results.Problem("Un error occurrio durante el registro");
-    }
-})
-.WithName("Register")
-.Produces<ApiResponse<UserDto>>(201)
-.Produces(400)
-.AllowAnonymous()
-.WithOpenApi();
-
-// POST /api/auth/login - Login de usuario
-app.MapPost("/api/auth/login", async (
-    LoginDto dto,
-    IUserService userService,
-    ITokenService tokenService,
-    IValidator<LoginDto> validator) =>
-{
-    var validationResult = await validator.ValidateAsync(dto);
-    if (!validationResult.IsValid)
-    {
-        return Results.BadRequest(ApiResponse<LoginResponseDto>.Fail(
-            "Validation fallida",
-            validationResult.Errors.Select(e => e.ErrorMessage).ToList()));
-    }
-
-    try
-    {
-        var user = await userService.ValidateCredentialsAsync(dto.Email, dto.Password);
-        if (user == null)
-        {
-            return Results.Unauthorized();// (ApiResponse<LoginResponseDto>.Fail("Credenciales invalidas"));
-        }
-
-        var token = tokenService.GenerateToken(user);
-        var response = new LoginResponseDto
-        {
-            User = user,
-            Token = token,
-            ExpiresIn = 3600 // 1 hora
-        };
-
-        return Results.Ok(ApiResponse<LoginResponseDto>.Ok(response, "Login ok"));
-    }
-    catch (Exception ex)
-    {
-        Log.Error(ex, "Error en el login");
-        return Results.Problem("Un error occurrio mientras se hacia login");
-    }
-})
-.WithName("Login")
-.Produces<ApiResponse<LoginResponseDto>>(200)
-.Produces(401)
-.AllowAnonymous()
-.WithOpenApi();
-
-// GET /api/users - Obtener todos los usuarios (Admin only)
-app.MapGet("/api/users", async (IUserService userService, ClaimsPrincipal user) =>
+// GET /api/users - Obtener todos los usuarios
+app.MapGet("/api/users", async (IUserService userService) =>
 {
     try
     {
-        // Verificar si es admin
-        if (!user.IsInRole("Admin"))
-        {
-            return Results.Forbid();
-        }
-
+        Log.Information("Getting all users");
         var users = await userService.GetAllUsersAsync();
-        return Results.Ok(ApiResponse<List<UserDto>>.Ok(users));
+        Log.Information("Retrieved {Count} users", users.Count);
+        return Results.Ok(ApiResponse<List<UserDto>>.Ok(users, "Users retrieved successfully"));
     }
     catch (Exception ex)
     {
-        Log.Error(ex, "Error obteniendo usuarios");
-        return Results.Problem("Un error occurrio mientras se obtenia los usuarios");
+        Log.Error(ex, "Error getting users");
+        return Results.Problem("An error occurred while fetching users");
     }
 })
-.RequireAuthorization()
 .WithName("GetUsers")
-.Produces<ApiResponse<List<UserDto>>>(200)
-.Produces(403)
-.WithOpenApi();
+.WithOpenApi()
+.Produces<ApiResponse<List<UserDto>>>(StatusCodes.Status200OK)
+.Produces(StatusCodes.Status500InternalServerError);
 
 // GET /api/users/{id} - Obtener usuario por ID
+// (Es el endpoint que Pedidos consulta en la Semana 3: "¿existe el usuario {id}?")
 app.MapGet("/api/users/{id:int}", async (int id, IUserService userService) =>
 {
     try
     {
+        Log.Information("Getting user with ID {UserId}", id);
         var user = await userService.GetUserByIdAsync(id);
-        if (user == null)
-            return Results.NotFound(ApiResponse<UserDto>.Fail($"Usuario con ID {id} no se encontro"));
 
+        if (user == null)
+        {
+            Log.Warning("User with ID {UserId} not found", id);
+            return Results.NotFound(ApiResponse<UserDto>.Fail($"User with ID {id} not found"));
+        }
+
+        Log.Information("User {UserId} retrieved successfully", id);
         return Results.Ok(ApiResponse<UserDto>.Ok(user));
     }
     catch (Exception ex)
     {
-        Log.Error(ex, "Error obteniendo usuario {UserId}", id);
-        return Results.Problem($"Un error occurrio mientras se consultaba al usuario {id}");
+        Log.Error(ex, "Error getting user {UserId}", id);
+        return Results.Problem($"An error occurred while fetching user {id}");
     }
 })
 .WithName("GetUserById")
-.Produces<ApiResponse<UserDto>>(200)
-.Produces(404)
-.WithOpenApi();
+.WithOpenApi()
+.Produces<ApiResponse<UserDto>>(StatusCodes.Status200OK)
+.Produces(StatusCodes.Status404NotFound);
 
-// PUT /api/users/{id}/validate-email - Validar email GDPR
-app.MapPut("/api/users/{id:int}/validate-email", async (
-    int id,
-    IUserService userService) =>
-{
-    try
-    {
-        var isValid = await userService.ValidateEmailGDPRAsync(id);
-        var message = isValid
-            ? "Email cumple con GDPR (EU domain)"
-            : "Email no cumple con GDPR (non-EU domain)";
-
-        return Results.Ok(ApiResponse<bool>.Ok(isValid, message));
-    }
-    catch (Exception ex)
-    {
-        Log.Error(ex, "Error validadando el correo del usuario {UserId}", id);
-        return Results.Problem($"Un error occurrio mientras se validaba el correo del usuario {id}");
-    }
-})
-.WithName("ValidateEmailGDPR")
-.Produces<ApiResponse<bool>>(200)
-.WithOpenApi();
-
-// GET /api/users/{id}/discount - Obtener descuento premium
-app.MapGet("/api/users/{id:int}/discount", async (
-    int id,
-    IUserService userService) =>
-{
-    try
-    {
-        var discount = await userService.GetUserDiscountAsync(id);
-        if (discount == null)
-            return Results.NotFound(ApiResponse<decimal>.Fail($"Usuario con ID {id} no se encontro"));
-
-        return Results.Ok(ApiResponse<decimal>.Ok(discount.Value,
-            $"Descuento para el usuario: {discount.Value:P}"));
-    }
-    catch (Exception ex)
-    {
-        Log.Error(ex, "Error al obtener el descuento del usuario {UserId}", id);
-        return Results.Problem($"Un error occurrio mientras se obtenia el descuento para el usuario {id}");
-    }
-})
-.WithName("GetUserDiscount")
-.Produces<ApiResponse<decimal>>(200)
-.Produces(404)
-.WithOpenApi();
-
+// POST /api/users - Crear nuevo usuario
 app.MapPost("/api/users", async (
     CreateUserDto dto,
     IUserService userService,
-    IValidator<CreateUserDto> validator,
-    IPublishEndpoint publishEndpoint) =>
+    IValidator<CreateUserDto> validator) =>
 {
+    // Validar la forma del dato (Tarea 2, B.3)
+    var validationResult = await validator.ValidateAsync(dto);
+    if (!validationResult.IsValid)
+    {
+        return Results.BadRequest(ApiResponse<UserDto>.Fail(
+            "Validation failed",
+            validationResult.Errors.Select(e => e.ErrorMessage).ToList()));
+    }
+
     try
     {
-        var validationResult = await validator.ValidateAsync(dto);
-        if (!validationResult.IsValid)
-        {
-            return Results.BadRequest(ApiResponse<UserDto>.Fail("Invalid user data"));
-        }
-
+        Log.Information("Creating new user with email {Email}", dto.Email);
         var user = await userService.CreateUserAsync(dto);
 
-        // Publicar evento
-        var userEvent = new UserCreatedEvent
-        {
-            UserId = user.Id,
-            Email = user.Email,
-            RandomNumber = Random.Shared.Next(1, 100)
-        };
-
-        await publishEndpoint.Publish(userEvent);
-        Log.Information("📤 Evento UserCreated publicado con número: {Number}",
-            userEvent.RandomNumber);
-
+        Log.Information("User created with ID {UserId}", user.Id);
         return Results.Created($"/api/users/{user.Id}",
-            ApiResponse<UserDto>.Ok(user, "Usuario creado y evento publicado"));
+            ApiResponse<UserDto>.Ok(user, "User created successfully"));
+    }
+    catch (InvalidOperationException ex)
+    {
+        // El email ya existe: es un error del cliente (400), no del servidor (500)
+        Log.Warning(ex, "Validation error creating user");
+        return Results.BadRequest(ApiResponse<UserDto>.Fail(ex.Message));
     }
     catch (Exception ex)
     {
-        Log.Error(ex, "Error creando usuario");
-        return Results.Problem("Error al crear el usuario");
+        Log.Error(ex, "Error creating user");
+        return Results.Problem("An error occurred while creating the user");
     }
 })
 .WithName("CreateUser")
 .WithOpenApi()
 .Produces<ApiResponse<UserDto>>(StatusCodes.Status201Created)
-.Produces(400);
+.Produces(StatusCodes.Status400BadRequest);
 
-
-// PUT /api/users/{id} - Actualizar usuario
-app.MapPut("/api/users/{id:int}", async (int id, UpdateUserDto dto, IUserService userService,
+// PUT /api/users/{id} - Actualizar usuario (Tarea 2, B.1)
+app.MapPut("/api/users/{id:int}", async (
+    int id,
+    UpdateUserDto dto,
+    IUserService userService,
     IValidator<UpdateUserDto> validator) =>
 {
+    var validationResult = await validator.ValidateAsync(dto);
+    if (!validationResult.IsValid)
+    {
+        return Results.BadRequest(ApiResponse<UserDto>.Fail(
+            "Validation failed",
+            validationResult.Errors.Select(e => e.ErrorMessage).ToList()));
+    }
+
     try
     {
-        // TODO (B.3): validar el dto con IValidator<UpdateUserDto> antes de actualizar
-        var validationResult = await validator.ValidateAsync(dto);
-        if (!validationResult.IsValid)
-        {
-            Log.Warning("Validation failed for updating user {UserId}: {Errors}", id,
-                validationResult.Errors.Select(e => e.ErrorMessage).ToList());
-            return Results.BadRequest(ApiResponse<UserDto>.Fail(
-                "Validation failed",
-                validationResult.Errors.Select(e => e.ErrorMessage).ToList()));
-        }
-
         Log.Information("Updating user {UserId}", id);
         var user = await userService.UpdateUserAsync(id, dto);
         if (user == null)
@@ -538,106 +291,60 @@ app.MapPut("/api/users/{id:int}", async (int id, UpdateUserDto dto, IUserService
 .WithOpenApi()
 .Produces<ApiResponse<UserDto>>(StatusCodes.Status200OK)
 .Produces(StatusCodes.Status404NotFound)
-.Produces(StatusCodes.Status400BadRequest)
-.WithSummary("Actualizar usuario")
-.WithDescription("Actualiza los datos de un usuario existente.");
+.Produces(StatusCodes.Status400BadRequest);
 
-// DELETE /api/users/{id} - Eliminar usuario
-app.MapDelete("/api/users/{id:int}", async (int id, IUserService catalogService) =>
+// DELETE /api/users/{id} - Eliminar usuario (borrado lógico, Tarea 2, B.2)
+app.MapDelete("/api/users/{id:int}", async (int id, IUserService userService) =>
 {
     try
     {
-        var result = await catalogService.DeleteUserAsync(id);
+        Log.Information("Deleting user {UserId}", id);
+        var result = await userService.DeleteUserAsync(id);
         if (!result)
-            return Results.NotFound(ApiResponse<bool>.Fail($"Usuario con ID {id} no se encontro"));
-
-        return Results.Ok(ApiResponse<bool>.Ok(true, "Usuario borrado ok"));
+        {
+            Log.Warning("User {UserId} not found for deletion", id);
+            return Results.NotFound(ApiResponse<bool>.Fail($"User with ID {id} not found"));
+        }
+        Log.Information("User {UserId} deleted successfully", id);
+        return Results.Ok(ApiResponse<bool>.Ok(true, "User deleted successfully"));
     }
     catch (Exception ex)
     {
-        Log.Error(ex, "Error borrando el usuario {UserId}", id);
-        return Results.Problem($"Un error occurrio mientras se borraba el usuario {id}");
+        Log.Error(ex, "Error deleting user {UserId}", id);
+        return Results.Problem($"An error occurred while deleting user {id}");
     }
 })
 .WithName("DeleteUser")
-.Produces<ApiResponse<bool>>(200)
-.Produces(404)
 .WithOpenApi()
-.WithSummary("Eliminar usuario")
-.WithDescription("Elimina logicamente el registro de un usuario existente.");
+.Produces<ApiResponse<bool>>(StatusCodes.Status200OK)
+.Produces(StatusCodes.Status404NotFound);
 
-///Endpoints definition end
 // Health check endpoint
 app.MapHealthChecks("/health");
 
 // Endpoint de información
-app.MapGet("/", () => new
+app.MapGet("/info", () => new
 {
-    Service = "Servicio de usuarios",
+    Service = "User Service",
+    Context = "Usuarios",
     Version = "1.0.0",
     Status = "Running",
+    Database = provider,
     Endpoints = new[]
     {
-        "POST /api/auth/register",
-        "POST /api/auth/login",
         "GET /api/users",
-        "PUT /api/users/{id}/validate-email",
-        "PUT /api/users/{id}",
         "GET /api/users/{id}",
-        "GET /api/users/{id}/discount",
+        "POST /api/users",
         "PUT /api/users/{id}",
         "DELETE /api/users/{id}",
         "GET /health"
     },
-    Documentation = "/swagger"
+    Documentation = "/ (Swagger UI)"
 });
 
-Console.WriteLine("🚀 Sistema E-Commerce Microservicio de Usuario iniciado");
-Console.WriteLine("📍 Swagger disponible en: https://localhost:7002/swagger");
+Console.WriteLine("Microservicio de Usuarios iniciado");
+Console.WriteLine("Swagger disponible en: http://localhost:5002 (o https://localhost:7002)");
 app.Run();
 
 // Hacer la clase Program testeable
 public partial class Program { }
-
-public class ProductCreatedConsumer : IConsumer<ProductCreatedEvent>
-{
-    private readonly ILogger<ProductCreatedConsumer> _logger;
-
-    public ProductCreatedConsumer(ILogger<ProductCreatedConsumer> logger)
-    {
-        _logger = logger;
-    }
-
-    public async Task Consume(ConsumeContext<ProductCreatedEvent> context)
-    {
-        var message = context.Message;
-
-        _logger.LogInformation("📨 EVENTO RECIBIDO EN USER SERVICE:");
-        _logger.LogInformation("   ProductId: {ProductId}", message.ProductId);
-        _logger.LogInformation("   ProductName: {ProductName}", message.ProductName);
-        _logger.LogInformation("   Price: ${Price}", message.Price);
-        _logger.LogInformation("   Message: {Message}", message.Message);
-        _logger.LogInformation("   CreatedAt: {CreatedAt}", message.CreatedAt);
-
-        // Simular procesamiento
-        await Task.Delay(1000);
-
-        // Aquí podrías:
-        // - Enviar email a usuarios premium sobre nuevo producto
-        // - Actualizar estadísticas
-        // - Guardar en cache
-        // - etc.
-
-        _logger.LogInformation("✅ Evento ProductCreated procesado exitosamente");
-    }
-}
-
-public class TestMessageConsumer : IConsumer<TestMessageEvent>
-{
-    public async Task Consume(ConsumeContext<TestMessageEvent> context)
-    {
-        Console.WriteLine($"📨 Mensaje recibido: {context.Message.Message}");
-        Console.WriteLine($"   Número: {context.Message.RandomNumber}");
-        await Task.CompletedTask;
-    }
-}
